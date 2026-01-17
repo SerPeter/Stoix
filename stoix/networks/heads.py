@@ -291,6 +291,83 @@ class QuantileDiscreteQNetwork(nn.Module):
         return distrax.EpsilonGreedy(preferences=q_values, epsilon=self.epsilon), q_dist
 
 
+class ImplicitQuantileDiscreteQNetwork(nn.Module):
+    """Implicit Quantile Network (IQN) head for discrete actions.
+
+    Unlike QR-DQN which uses fixed quantiles, IQN samples tau values at runtime
+    and embeds them using cosine features. This allows learning an implicit
+    representation of the full return distribution.
+
+    Reference: Dabney et al. (2018) "Implicit Quantile Networks for Distributional RL"
+    https://arxiv.org/abs/1806.06923
+    """
+
+    action_dim: int
+    epsilon: float
+    num_tau_samples: int = 64
+    num_cosines: int = 64
+    embedding_dim: int = 64
+    kernel_init: Initializer = lecun_normal()
+
+    @nn.compact
+    def __call__(
+        self, embedding: chex.Array, tau: Optional[chex.Array] = None, key: Optional[chex.PRNGKey] = None
+    ) -> Tuple[distrax.EpsilonGreedy, chex.Array, chex.Array]:
+        """Forward pass.
+
+        Args:
+            embedding: (batch, embed_dim) observation embedding from torso
+            tau: (batch, num_tau) optional pre-sampled tau values in [0, 1]
+            key: PRNG key for sampling tau if not provided
+
+        Returns:
+            policy: EpsilonGreedy distribution over actions
+            q_quantiles: (batch, num_tau, action_dim) quantile Q-values
+            tau: (batch, num_tau) the tau values used
+        """
+        batch_size = embedding.shape[0]
+
+        # Sample tau if not provided
+        if tau is None:
+            if key is None:
+                raise ValueError("Either tau or key must be provided")
+            tau = jax.random.uniform(key, (batch_size, self.num_tau_samples))
+
+        num_tau = tau.shape[1]
+
+        # Cosine embedding of tau: cos(pi * i * tau) for i in [0, num_cosines)
+        # tau: (batch, num_tau) -> (batch, num_tau, 1)
+        tau_expanded = tau[:, :, None]
+        # i_pi: (1, 1, num_cosines)
+        i_pi = jnp.pi * jnp.arange(self.num_cosines)[None, None, :]
+        # cosine features: (batch, num_tau, num_cosines)
+        cosine_features = jnp.cos(tau_expanded * i_pi)
+
+        # Embed cosine features: (batch, num_tau, embedding_dim)
+        tau_embedding = nn.Dense(self.embedding_dim, kernel_init=self.kernel_init)(cosine_features)
+        tau_embedding = jax.nn.relu(tau_embedding)
+
+        # Combine observation embedding with tau embedding
+        # embedding: (batch, embed_dim) -> (batch, 1, embed_dim) -> (batch, num_tau, embed_dim)
+        obs_embedding = jnp.expand_dims(embedding, axis=1)
+        obs_embedding = jnp.broadcast_to(obs_embedding, (batch_size, num_tau, embedding.shape[-1]))
+
+        # Element-wise product (Hadamard product as in IQN paper)
+        # Note: We project obs_embedding to match tau_embedding dim first
+        obs_projected = nn.Dense(self.embedding_dim, kernel_init=self.kernel_init)(obs_embedding)
+        combined = obs_projected * tau_embedding
+
+        # Output Q-values for each action at each quantile
+        # combined: (batch, num_tau, embedding_dim) -> (batch, num_tau, action_dim)
+        q_quantiles = nn.Dense(self.action_dim, kernel_init=self.kernel_init)(combined)
+
+        # Mean Q-values across quantiles for action selection
+        q_values = jnp.mean(q_quantiles, axis=1)  # (batch, action_dim)
+        q_values = jax.lax.stop_gradient(q_values)
+
+        return distrax.EpsilonGreedy(preferences=q_values, epsilon=self.epsilon), q_quantiles, tau
+
+
 class LinearHead(nn.Module):
     output_dim: int
     kernel_init: Initializer = orthogonal(0.01)
@@ -299,6 +376,35 @@ class LinearHead(nn.Module):
     def __call__(self, embedding: chex.Array) -> chex.Array:
 
         return nn.Dense(self.output_dim, kernel_init=self.kernel_init)(embedding)
+
+
+class QuantileContinuousQNetwork(nn.Module):
+    """Distributional Q-network head for continuous actions using quantile regression.
+
+    Instead of outputting a single Q-value, outputs N quantile values
+    representing the return distribution Z(s, a). This enables risk-sensitive
+    policies via CVaR, VaR, etc.
+
+    Used in DSAC (Distributional Soft Actor-Critic).
+
+    Reference: Ma et al. (2020) "DSAC: Distributional Soft Actor Critic"
+    https://arxiv.org/abs/2004.14547
+    """
+
+    num_quantiles: int = 32
+    kernel_init: Initializer = lecun_normal()
+
+    @nn.compact
+    def __call__(self, embedding: chex.Array) -> chex.Array:
+        """Forward pass.
+
+        Args:
+            embedding: (batch, embed_dim) observation-action embedding from torso
+
+        Returns:
+            quantiles: (batch, num_quantiles) return distribution quantiles
+        """
+        return nn.Dense(self.num_quantiles, kernel_init=self.kernel_init)(embedding)
 
 
 class MultiDiscreteHead(nn.Module):
