@@ -265,6 +265,187 @@ def quantile_regression_loss(
     return jnp.sum(jnp.mean(loss, axis=-1), axis=-1)
 
 
+def dsac_quantile_loss(
+    quantiles: chex.Array,
+    target_quantiles: chex.Array,
+    tau: chex.Array,
+    huber_param: float = 1.0,
+) -> chex.Array:
+    """Compute quantile Huber loss for DSAC.
+
+    This is used for training distributional Q-networks in continuous action spaces.
+
+    Args:
+        quantiles: (batch, num_quantiles) predicted quantile values
+        target_quantiles: (batch, num_quantiles) target quantile values
+        tau: (num_quantiles,) fixed quantile fractions (midpoints)
+        huber_param: Huber loss parameter (kappa)
+
+    Returns:
+        Scalar loss value (mean over batch)
+    """
+    # Pairwise TD errors: (batch, num_quantiles, num_quantiles)
+    # quantiles[:, :, None] - target_quantiles[:, None, :]
+    delta = target_quantiles[:, None, :] - quantiles[:, :, None]
+
+    # Indicator for negative TD errors
+    delta_neg = (delta < 0.0).astype(jnp.float32)
+    delta_neg = jax.lax.stop_gradient(delta_neg)
+
+    # Quantile weights: |tau - I(delta < 0)|
+    # tau: (num_quantiles,) -> (1, num_quantiles, 1)
+    weight = jnp.abs(tau[None, :, None] - delta_neg)
+
+    # Huber loss
+    if huber_param > 0.0:
+        loss = rlax.huber_loss(delta, huber_param)
+    else:
+        loss = jnp.abs(delta)
+    loss *= weight
+
+    # Average over both quantile dimensions, then batch
+    return jnp.mean(jnp.sum(jnp.mean(loss, axis=-1), axis=-1))
+
+
+def risk_sensitive_value(
+    quantiles: chex.Array,
+    tau: chex.Array,
+    risk_measure: str = "neutral",
+    risk_param: float = 0.25,
+) -> chex.Array:
+    """Compute risk-sensitive value from quantile distribution.
+
+    Args:
+        quantiles: (batch, num_quantiles) quantile values
+        tau: (num_quantiles,) quantile fractions
+        risk_measure: "neutral", "cvar", "var", "mean_std", "wang", "cpw"
+        risk_param: parameter for the risk measure
+
+    Returns:
+        (batch,) risk-adjusted values
+    """
+    if risk_measure == "neutral":
+        return jnp.mean(quantiles, axis=-1)
+
+    elif risk_measure == "cvar":
+        # CVaR at alpha: mean of quantiles below alpha
+        alpha = risk_param
+        mask = tau <= alpha
+        # Use weighted mean to handle edge cases
+        weights = mask.astype(jnp.float32)
+        weights = weights / (jnp.sum(weights) + 1e-8)
+        return jnp.sum(quantiles * weights[None, :], axis=-1)
+
+    elif risk_measure == "var":
+        # VaR at alpha: quantile at alpha
+        alpha = risk_param
+        idx = jnp.searchsorted(tau, alpha)
+        idx = jnp.clip(idx, 0, len(tau) - 1)
+        return quantiles[:, idx]
+
+    elif risk_measure == "mean_std":
+        # Mean - lambda * std
+        lam = risk_param
+        mean = jnp.mean(quantiles, axis=-1)
+        std = jnp.std(quantiles, axis=-1)
+        return mean - lam * std
+
+    else:
+        # Default to neutral
+        return jnp.mean(quantiles, axis=-1)
+
+
+def iqn_quantile_regression_loss(
+    dist_src: chex.Array,
+    tau_src: chex.Array,
+    dist_target: chex.Array,
+    huber_param: float = 0.0,
+) -> chex.Array:
+    """Compute quantile regression loss for IQN with runtime-sampled tau.
+
+    This loss is similar to quantile_regression_loss but handles the case where
+    tau values are sampled at runtime (as in IQN) rather than fixed (as in QR-DQN).
+
+    Args:
+        dist_src: (batch, num_tau_src) source quantile estimates
+        tau_src: (batch, num_tau_src) tau values for source quantiles
+        dist_target: (batch, num_tau_target) target quantile estimates
+        huber_param: Huber loss parameter (0 for no Huber loss)
+
+    Returns:
+        Scalar loss value (mean over batch)
+    """
+    # dist_src: (batch, num_tau_src)
+    # dist_target: (batch, num_tau_target)
+    # Compute pairwise TD errors: (batch, num_tau_src, num_tau_target)
+    delta = dist_target[:, None, :] - dist_src[:, :, None]
+
+    # Indicator for negative TD errors
+    delta_neg = (delta < 0.0).astype(jnp.float32)
+    delta_neg = jax.lax.stop_gradient(delta_neg)
+
+    # Quantile weights: |tau - I(delta < 0)|
+    # tau_src: (batch, num_tau_src) -> (batch, num_tau_src, 1)
+    weight = jnp.abs(tau_src[:, :, None] - delta_neg)
+
+    # Huber loss or absolute loss
+    if huber_param > 0.0:
+        loss = rlax.huber_loss(delta, huber_param)
+    else:
+        loss = jnp.abs(delta)
+    loss *= weight
+
+    # Average over target tau, sum over source tau, then average over batch
+    return jnp.mean(jnp.sum(jnp.mean(loss, axis=-1), axis=-1))
+
+
+def iqn_q_learning(
+    q_quantiles_tm1: chex.Array,
+    tau_tm1: chex.Array,
+    a_tm1: chex.Array,
+    r_t: chex.Array,
+    d_t: chex.Array,
+    q_quantiles_t: chex.Array,
+    tau_t: chex.Array,
+    huber_param: float = 0.0,
+) -> chex.Array:
+    """Compute IQN Q-learning loss with runtime-sampled tau values.
+
+    Reference: Dabney et al. (2018) "Implicit Quantile Networks for Distributional RL"
+
+    Args:
+        q_quantiles_tm1: (batch, num_tau, action_dim) quantiles at t-1
+        tau_tm1: (batch, num_tau) tau values at t-1
+        a_tm1: (batch,) actions taken at t-1
+        r_t: (batch,) rewards at t
+        d_t: (batch,) discount factors at t
+        q_quantiles_t: (batch, num_tau_prime, action_dim) target quantiles at t
+        tau_t: (batch, num_tau_prime) tau values at t (for target)
+        huber_param: Huber loss parameter (default 0 for no Huber)
+
+    Returns:
+        Scalar loss value
+    """
+    batch_size = a_tm1.shape[0]
+    batch_indices = jnp.arange(batch_size)
+
+    # Select quantiles for taken action: (batch, num_tau)
+    dist_qa_tm1 = q_quantiles_tm1[batch_indices, :, a_tm1]
+
+    # Select greedy action based on mean Q-values
+    q_values_t = jnp.mean(q_quantiles_t, axis=1)  # (batch, action_dim)
+    a_t = jnp.argmax(q_values_t, axis=-1)  # (batch,)
+
+    # Select target quantiles for greedy action: (batch, num_tau_prime)
+    dist_qa_t = q_quantiles_t[batch_indices, :, a_t]
+
+    # Compute target distribution with Bellman backup
+    dist_target = r_t[:, None] + d_t[:, None] * dist_qa_t
+    dist_target = jax.lax.stop_gradient(dist_target)
+
+    return iqn_quantile_regression_loss(dist_qa_tm1, tau_tm1, dist_target, huber_param)
+
+
 def quantile_q_learning(
     dist_q_tm1: chex.Array,
     tau_q_tm1: chex.Array,

@@ -1,0 +1,25 @@
+# --- Defaults FF-IQN ---
+
+system_name: ff_iqn # Name of the system.
+
+# --- RL hyperparameters ---
+rollout_length: 1 # Number of environment steps per vectorised environment.
+epochs: 1 # Number of sgd steps per rollout.
+warmup_steps: 32  # Number of steps to collect before training.
+total_buffer_size: 500_000 # Total effective size of the replay buffer across all devices.
+total_batch_size: 256 # Total effective number of samples to train on.
+q_lr: 5e-5  # the learning rate of the Q network network optimizer
+tau: 0.005  # smoothing coefficient for target networks
+gamma: 0.99  # discount factor
+max_grad_norm: 0.5 # Maximum norm of the gradients for a weight update.
+decay_learning_rates: False # Whether learning rates should be linearly decayed during training.
+training_epsilon: 0.1  # epsilon for the epsilon-greedy policy during training
+evaluation_epsilon: 0.00  # epsilon for the epsilon-greedy policy during evaluation
+max_abs_reward : 1000.0  # maximum absolute reward value
+huber_loss_parameter: 1.0  # parameter for the huber loss. If 0, it uses absolute loss.
+
+# --- IQN-specific parameters ---
+num_tau_samples: 64  # number of tau samples for online network (N in paper)
+num_tau_prime_samples: 64  # number of tau samples for target network (N' in paper)
+num_cosines: 64  # number of cosine basis functions for tau embedding
+embedding_dim: 64  # dimension of the tau embedding
